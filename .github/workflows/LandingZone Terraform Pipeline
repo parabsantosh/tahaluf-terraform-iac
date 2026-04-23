@@ -1,0 +1,288 @@
+name: LandingZone Terraform Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_environment:
+        description: "Select deployment environment boundary"
+        required: true
+        type: choice
+        options:
+          - foundation-nonprod
+          - foundation-prod
+
+      target_subscription:
+        description: "Select target subscription"
+        required: true
+        type: choice
+        options:
+          - hub
+          - hubnonprod
+          - identity
+          - mgmt
+          - prod
+          - nonprod
+          - security
+          - sandbox
+
+      module:
+        description: "Infrastructure module to deploy"
+        required: true
+        type: choice
+        options:
+          - 01-RG-LAW-STA-VNET-PEERING-VGW
+          - 02-AZFW
+          - 03-FG
+          - 04-BASTION
+          - 05-NSG-RT
+          - 06-SUBSCRIPTION-CONFIGURATIONS
+          - 07-AZPOLICY
+          - 08-AZURE-DNS-PRIVATE-RESOLVER
+
+env:
+  TF_VERSION: "1.9.8"
+  ARM_USE_OIDC: "true"
+
+jobs:
+  terraform-plan:
+    name: "Plan ► ${{ inputs.module }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.deployment_environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      state_key: ${{ steps.state.outputs.state_key }}
+      subscription_id: ${{ steps.sub.outputs.subscription_id }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve target subscription ID
+        id: sub
+        shell: bash
+        run: |
+          case "${{ inputs.target_subscription }}" in
+            hub)         SUB_ID="${{ vars.HUB_SUBSCRIPTION_ID }}" ;;
+            hubnonprod)  SUB_ID="${{ vars.HUBNONPROD_SUBSCRIPTION_ID }}" ;;
+            identity)    SUB_ID="${{ vars.IDENTITY_SUBSCRIPTION_ID }}" ;;
+            mgmt)        SUB_ID="${{ vars.MGMT_SUBSCRIPTION_ID }}" ;;
+            prod)        SUB_ID="${{ vars.PROD_SUBSCRIPTION_ID }}" ;;
+            nonprod)     SUB_ID="${{ vars.NONPROD_SUBSCRIPTION_ID }}" ;;
+            security)    SUB_ID="${{ vars.SECURITY_SUBSCRIPTION_ID }}" ;;
+            sandbox)     SUB_ID="${{ vars.SANDBOX_SUBSCRIPTION_ID }}" ;;
+            *)
+              echo "::error::Unknown target subscription"
+              exit 1
+              ;;
+          esac
+
+          echo "subscription_id=$SUB_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved subscription ID for ${{ inputs.target_subscription }}"
+
+      - name: Validate environment/subscription combination
+        shell: bash
+        run: |
+          if [[ "${{ inputs.deployment_environment }}" == "foundation-prod" ]]; then
+            case "${{ inputs.target_subscription }}" in
+              hub|identity|mgmt|prod|security) exit 0 ;;
+              *)
+                echo "::error::Subscription ${{ inputs.target_subscription }} is not allowed for foundation-prod"
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [[ "${{ inputs.deployment_environment }}" == "foundation-nonprod" ]]; then
+            case "${{ inputs.target_subscription }}" in
+              hubnonprod|nonprod|sandbox) exit 0 ;;
+              *)
+                echo "::error::Subscription ${{ inputs.target_subscription }} is not allowed for foundation-nonprod"
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Derive backend state key
+        id: state
+        shell: bash
+        run: |
+          MODULE="${{ inputs.module }}"
+          ENVNAME="${{ inputs.deployment_environment }}"
+          TARGET="${{ inputs.target_subscription }}"
+
+          case "$MODULE" in
+            01-RG-LAW-STA-VNET-PEERING-VGW) KEY="01-${ENVNAME}-${TARGET}.tfstate" ;;
+            02-AZFW)                        KEY="02-${ENVNAME}-${TARGET}.tfstate" ;;
+            03-FG)                          KEY="03-${ENVNAME}-${TARGET}.tfstate" ;;
+            04-BASTION)                     KEY="04-${ENVNAME}-${TARGET}.tfstate" ;;
+            05-NSG-RT)                      KEY="05-${ENVNAME}-${TARGET}.tfstate" ;;
+            06-SUBSCRIPTION-CONFIGURATIONS) KEY="06-${ENVNAME}-${TARGET}.tfstate" ;;
+            07-AZPOLICY)                    KEY="07-${ENVNAME}-${TARGET}.tfstate" ;;
+            08-AZURE-DNS-PRIVATE-RESOLVER)  KEY="08-${ENVNAME}-${TARGET}.tfstate" ;;
+            *)
+              echo "::error::Unknown module: $MODULE"
+              exit 1
+              ;;
+          esac
+
+          echo "state_key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "State key: $KEY"
+
+      - name: Azure Login using UAMI via OIDC
+        uses: azure/login@v2
+        with:
+          auth-type: IDENTITY
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.subscription_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.module }}
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.subscription_id }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_SA }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ steps.state.outputs.state_key }}" \
+            -reconfigure \
+            -input=false
+
+      - name: Terraform Validate
+        working-directory: ${{ inputs.module }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ inputs.module }}
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.subscription_id }}
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -input=false \
+            -no-color \
+            2>&1 | tee plan-output.txt
+
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish plan summary
+        if: always()
+        working-directory: ${{ inputs.module }}
+        shell: bash
+        run: |
+          {
+            echo "## Terraform Plan"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Module | \`${{ inputs.module }}\` |"
+            echo "| Deployment environment | \`${{ inputs.deployment_environment }}\` |"
+            echo "| Target subscription | \`${{ inputs.target_subscription }}\` |"
+            echo "| State key | \`${{ steps.state.outputs.state_key }}\` |"
+            echo "| Triggered by | \`${{ github.actor }}\` |"
+            echo ""
+            echo "### Plan output"
+            echo '```hcl'
+            terraform show -no-color tfplan 2>/dev/null || cat plan-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.module }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.module }}/tfplan
+            ${{ inputs.module }}/.terraform.lock.hcl
+          retention-days: 7
+          if-no-files-found: error
+
+  terraform-apply:
+    name: "Apply ► ${{ inputs.module }}"
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    environment: ${{ inputs.deployment_environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login using UAMI via OIDC
+        uses: azure/login@v2
+        with:
+          auth-type: IDENTITY
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.terraform-plan.outputs.subscription_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.module }}-${{ github.run_id }}
+          path: ${{ inputs.module }}
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.module }}
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ needs.terraform-plan.outputs.subscription_id }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ vars.BACKEND_SA }}" \
+            -backend-config="container_name=${{ vars.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ needs.terraform-plan.outputs.state_key }}" \
+            -reconfigure \
+            -input=false
+
+      - name: Terraform Apply
+        working-directory: ${{ inputs.module }}
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ needs.terraform-plan.outputs.subscription_id }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -input=false \
+            tfplan
+
+      - name: Publish apply summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Terraform Apply"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Module | \`${{ inputs.module }}\` |"
+            echo "| Deployment environment | \`${{ inputs.deployment_environment }}\` |"
+            echo "| Run ID | \`${{ github.run_id }}\` |"
+            echo "| Status | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
